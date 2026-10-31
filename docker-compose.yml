@@ -1,0 +1,178 @@
+name: mitweek
+
+services:
+  go-api:
+    build: ../backend
+    env_file: ../backend/.env
+    environment:
+      ANALYSIS_URL: http://analysis-service:8000
+      PORT: 8080
+      ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001
+    ports:
+      - "8080:8080"
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      analysis-service:
+        condition: service_healthy
+
+  analysis-service:
+    build: ../analysis-service
+    env_file: ../analysis-service/.env
+    environment:
+      PORT: 8000
+      BROWSER_WORKER_URL: http://browser-gateway:8002
+      FILE_WORKER_URL: http://analysis-worker:8003
+    depends_on:
+      browser-gateway:
+        condition: service_healthy
+      analysis-worker:
+        condition: service_healthy
+    expose:
+      - "8000"
+    networks:
+      - backend
+      - browser-control
+      - worker-control
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://localhost:8000/internal/v1/health',headers={'X-Service-Key':os.environ['SERVICE_API_KEY']}); urllib.request.urlopen(r)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  analysis-worker:
+    build:
+      context: ../analysis-service
+      dockerfile: Dockerfile.worker
+    env_file: ../analysis-service/.env.worker
+    environment:
+      TMPDIR: /tmp
+      MPLCONFIGDIR: /tmp/mpl
+    expose:
+      - "8003"
+    networks:
+      - worker-control
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://localhost:8003/internal/v1/health',headers={'X-Service-Key':os.environ['FILE_WORKER_SERVICE_KEY']}); urllib.request.urlopen(r)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  browser-egress:
+    build:
+      context: ../analysis-service
+      dockerfile: Dockerfile.egress
+    env_file: ../analysis-service/.env.browser
+    command: ["python", "-m", "app.egress_proxy"]
+    expose:
+      - "8888"
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      browser-egress-internal:
+        ipv4_address: 172.29.254.2
+      internet-egress: {}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8888),2); s.close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  browser-worker:
+    build:
+      context: ../analysis-service
+      dockerfile: Dockerfile.browser
+    env_file: ../analysis-service/.env.browser
+    environment:
+      PORT: 8001
+    expose:
+      - "8001"
+    networks:
+      browser-egress-internal:
+        ipv4_address: 172.29.254.3
+      browser-worker-internal: {}
+    depends_on:
+      browser-egress:
+        condition: service_healthy
+    init: true
+    shm_size: 256m
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://localhost:8001/internal/v1/health',headers={'X-Service-Key':os.environ['BROWSER_SERVICE_KEY']}); urllib.request.urlopen(r)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  browser-gateway:
+    build:
+      context: ../analysis-service
+      dockerfile: Dockerfile.gateway
+    env_file: ../analysis-service/.env.browser
+    expose:
+      - "8002"
+    networks:
+      - browser-control
+      - browser-worker-internal
+    depends_on:
+      browser-worker:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://localhost:8002/internal/v1/health',headers={'X-Service-Key':os.environ['BROWSER_SERVICE_KEY']}); urllib.request.urlopen(r)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  frontend:
+    build:
+      context: ../frontend
+    env_file: ../frontend/.env
+    environment:
+      INTERNAL_API_BASE_URL: http://go-api:8080
+    ports:
+      - "3000:3000"
+    networks:
+      - frontend
+    depends_on:
+      - go-api
+
+networks:
+  frontend: {}
+  backend: {}
+  browser-egress-internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.254.0/24
+  browser-worker-internal:
+    internal: true
+  browser-control:
+    internal: true
+  worker-control:
+    internal: true
+  internet-egress: {}
