@@ -4,6 +4,8 @@ Disusun: 2026-10-31. Rujukan: `threatlens-handoff.md` (spesifikasi awal), `threa
 
 > Catatan struktur: dokumen ini dibuat sebelum pemisahan repo. Workspace kini memakai `infra/` untuk Compose/Supabase/docs dan tiga folder layanan sejajar. Untuk Compose gunakan `docker compose -f infra/docker-compose.yml ...`; file env tetap di masing-masing service folder.
 
+> **Perubahan 2026-11-03:** fitur **scan gambar** dan **scan pesan/teks** dihapus. Produk sekarang hanya menyediakan **deteksi URL, APK, dan nomor telepon**. Baris "Scanner" di bawah ini dan semua sebutan message/image/OCR/vision adalah kondisi per 2026-10-31, bukan kondisi sekarang. Modul yang dilepas disimpan di `.removed-scans/` (root repo), bukan dihapus permanen.
+
 ---
 
 ## 1. Status sekarang (fakta terverifikasi)

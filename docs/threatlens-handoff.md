@@ -4,6 +4,8 @@ Kamu adalah engineer yang mengimplementasikan **ThreatLens** ke dalam repo proye
 
 Dokumen ini adalah spesifikasi kerja. Ikuti alur dan batasan di bawah. Kalau ada yang bertentangan dengan kondisi repo, **cek repo dulu**, lalu sesuaikan dengan konvensi yang sudah ada dan catat penyesuaiannya di laporan akhir.
 
+> **Catatan 2026-11-03 — cakupan dipangkas.** Fitur **scan gambar (tangkapan layar)** dan **scan pesan/teks** sudah dihapus dari produk. Yang tersisa hanya **deteksi URL, berkas APK, dan nomor telepon**. Bagian dokumen ini yang masih menyebut `message`, `image`, OCR, atau vision adalah catatan spesifikasi lama, bukan perilaku sistem saat ini. Berkas hasil pemindahan ada di `.removed-scans/` (root repo) bila perlu ditinjau kembali.
+
 ---
 
 ## 0. Cara kerja yang diminta
@@ -96,6 +98,10 @@ Semua fungsi backend Go (routing endpoint, upload file, pencatatan LLM, history,
 | `auth_events` | id, user_id, event (login, logout, idle_logout, turnstile_fail, jwt_invalid, ...), ip, user_agent, created_at |
 | `llm_usage` | id, scan_id, model, prompt_tokens, completion_tokens, latency_ms, status, created_at (**tanpa** isi prompt atau respons) |
 | `phone_reports` | id, number_e164, category, source, reported_by (nullable), status, created_at (laporan komunitas untuk phone scanner) |
+| `community_posts` | id, number_e164, category, title, body, evidence_url, evidence_public_id, author_user_id, author_alias, status, up_count, down_count, score (generated), comment_count, created_at — cerita warga, **bukan** sinyal risiko |
+| `community_votes` | post_id + user_id (PK), value (±1) — satu suara per akun per cerita; hanya mengubah urutan feed |
+| `community_comments` | id, post_id, parent_id (self-FK, maksimal satu tingkat), body, author_user_id, author_alias, status, created_at |
+| `dangerous_numbers` (view) | agregat `phone_reports` (laporan terverifikasi ≥2 dari ≥2 pelapor) + hitungan cerita; dipakai tab "Nomor berbahaya" |
 
 Checkpoint LangGraph disimpan di schema terpisah (mis. `langgraph`) yang **tidak diekspos** lewat PostgREST/API Supabase.
 
@@ -216,7 +222,7 @@ Gunakan framework dan komponen yang sudah ada di repo.
 
 Form yang sudah ada (**tautan, pesan, APK, gambar**) disambungkan ke endpoint baru. Tambahkan **form baru untuk cek nomor telepon**:
 
-- Field nomor dengan pemilih kode negara (default `ID`/+62) dan validasi ringan di client. Normalisasi final dilakukan backend.
+- Field nomor dengan validasi ringan di client; normalisasi final dilakukan backend. **Deviasi disengaja (2026-11-04):** tidak ada pemilih kode negara — cakupan produk hanya nomor Indonesia, jadi UI menampilkan chip `+62` tetap dan validasi 9–12 digit setelah `+62`, dan backend menolak nomor yang country code-nya bukan 62 (`not_indonesian` / temuan "di luar cakupan").
 - Submit memanggil `POST /api/v1/scans/phone` dengan `{ number, default_region }`.
 - Tampilkan state: mengirim, menunggu (polling dengan `X-Activity: passive`), selesai, dan gagal.
 - Hasil memakai komponen laporan yang sama dengan scan lain: level risiko, confidence, coverage, temuan, rekomendasi, dan **keterbatasan** (nomor bisa dipalsukan, berpindah pemilik, laporan bisa keliru).
@@ -291,9 +297,7 @@ Semua di bawah `/api/v1`.
 | Method | Path | Fungsi |
 |---|---|---|
 | POST | `/scans/url` | Body `{ "url": "..." }` |
-| POST | `/scans/message` | Body `{ "text": "..." }` |
 | POST | `/scans/phone` | Body `{ "number": "...", "default_region": "ID" }` |
-| POST | `/scans/image` | `multipart/form-data`, field `file` |
 | POST | `/scans/application` | `multipart/form-data`, field `file`, plus `consent_external_upload` (bool) |
 | GET | `/scans/{scan_id}` | Status dan hasil (milik user itu saja) |
 | GET | `/scans` | Riwayat scan user (paginasi) |
@@ -313,7 +317,7 @@ Semua endpoint wajib header `X-Service-Key` (dari env, dibandingkan secara const
 | GET | `/internal/v1/jobs/{job_id}` | Status job, dan `report` + `llm_usage` kalau sudah selesai |
 | GET | `/internal/v1/health` | Health check |
 
-`type` ∈ `url | message | phone | image | application`.
+`type` ∈ `url | phone | application`.
 
 ### 6.3 Skema hasil (kontrak bersama Go dan Python)
 
@@ -420,9 +424,7 @@ LLM **tidak** boleh punya akses shell, filesystem bebas, atau jaringan bebas. To
 | Scanner | Sumber / tool |
 |---|---|
 | URL | Google Safe Browsing, VirusTotal, Playwright, analisis LLM |
-| Message | Analisis LLM, ekstraksi indikator, Exa untuk verifikasi klaim, URL → URL scanner |
 | Phone | Normalisasi dengan `phonenumbers`, layanan reputasi (jika ada), laporan komunitas dari tabel `phone_reports` |
-| Image | OCR (default: `pytesseract` dengan bahasa `ind+eng`, sesuaikan jika repo punya pilihan lain), lalu alur Message, URL → URL scanner, vision model OpenAI opsional |
 | Application | SHA-256, lookup hash (VirusTotal), analisis statis (MobSF / JADX / Apktool) untuk sampel tidak dikenal |
 
 Aturan:
