@@ -42,7 +42,11 @@ create table if not exists public.scan_evidence (
 
 -- Kolom yang hilang kalau tabelnya sudah lebih dulu dibuat ad-hoc. Default pada kolom NOT NULL
 -- sekaligus mengisi baris lama, jadi tidak ada insert yang tiba-tiba menabrak not-null.
+-- `id` ikut dipulihkan karena app/retention.py DELETE dengan params select=id: tanpa kolom itu
+-- PostgREST menolak permintaan (400) dan purge bukti berhenti dengan status partial — barisnya
+-- tidak pernah hilang meski expires_at-nya sudah lewat.
 alter table public.scan_evidence_items
+  add column if not exists id uuid default gen_random_uuid() not null,
   add column if not exists skill text not null default '',
   add column if not exists observed boolean not null default true,
   add column if not exists fact text not null default '',
@@ -51,6 +55,7 @@ alter table public.scan_evidence_items
   add column if not exists expires_at timestamptz not null default (now() + interval '7 days');
 
 alter table public.scan_evidence
+  add column if not exists id uuid default gen_random_uuid() not null,
   add column if not exists threat_intel jsonb not null default '{}'::jsonb,
   add column if not exists recon_data jsonb not null default '{}'::jsonb,
   add column if not exists browser_data jsonb not null default '{}'::jsonb,
@@ -78,17 +83,20 @@ create index if not exists scan_evidence_expires_idx
 create index if not exists scan_evidence_items_scan_idx
   on public.scan_evidence_items (scan_id, kind);
 
--- Constraint di bawah memakai nama yang SAMA dengan yang di dalam CREATE TABLE, jadi pada project
--- fresh blok ini tidak melakukan apa-apa (duplicate_object ditangkap) dan pada project yang tabelnya
--- sudah dibuat ad-hoc blok inilah yang memasang FK + CHECK. Yang tidak dipulihkan oleh migration
--- ini adalah nullability kolom lama (mis. payload yang tadinya boleh NULL): tidak pernah bikin
--- insert gagal, karena kode selalu mengirim nilai. Yang lain sengaja dibiarkan gagal supaya
--- kelihatan — misalnya foreign_key_violation berarti tabel lama masih punya baris yatim dan
--- perlu dibersihkan sebelum FK bisa dipasang.
+-- Constraint di bawah memakai nama yang SAMA dengan yang dihasilkan PostgreSQL untuk penulisan di
+-- dalam CREATE TABLE (pkey/fkey otomatis dinamai <tabel>_pkey dan <tabel>_<kolom>_fkey), jadi pada
+-- project fresh blok ini tidak melakukan apa-apa dan pada project yang tabelnya dibuat ad-hoc blok
+-- inilah yang memasang primary key, FK + CHECK. Yang sengaja tidak dipulihkan: nullability kolom
+-- lama (mis. payload/threat_intel yang tadinya boleh NULL) — tidak pernah membuat insert gagal
+-- karena kode selalu mengirim nilai. duplicate_object dan invalid_table_definition berarti "sudah
+-- terpasang, lewati"; kesalahan lain dibiarkan gagal supaya kelihatan — misalnya
+-- foreign_key_violation artinya tabel lama masih punya baris yatim yang harus dibersihkan dulu.
 do $constraints$
 declare
   v_stmt text;
   v_stmts text[] := array[
+    'alter table public.scan_evidence_items add constraint scan_evidence_items_pkey primary key (id)',
+    'alter table public.scan_evidence add constraint scan_evidence_pkey primary key (id)',
     -- Bentuk evidence_id dibangkitkan EvidenceStore.add(): "ev_<kind>_<sha256[:12]>", dengan kind
     -- mengikuti KIND_RE di berkas yang sama. Kalau salah satu diubah, ubah yang di Python juga —
     -- sama alasannya dengan community_posts_alias_shape pada 0007.
@@ -108,7 +116,9 @@ begin
   foreach v_stmt in array v_stmts loop
     begin
       execute v_stmt;
-    exception when duplicate_object then null;
+    exception
+      when duplicate_object then null;
+      when invalid_table_definition then null;
     end;
   end loop;
 end $constraints$;
@@ -139,12 +149,30 @@ comment on column public.scan_evidence_items.expires_at is
 comment on table public.scan_evidence is
   'Snapshot satu baris per scan (threat_intel, recon_data, browser_data); upsert lewat on_conflict=scan_id.';
 
--- Setelah Run, pastikan keduanya cocok dengan yang dibutuhkan kode (expect 11 dan 2):
+-- Sebelum Run pada project yang tabelnya sudah ada, cek apakah ada baris yang membuat FK gagal.
+-- Baris dengan scan_id milik scan yang sudah dihapus, atau user_id placeholder
+-- 00000000-0000-0000-0000-000000000000 (default parameter scan_url() di app/scanners.py), keduanya
+-- membuat statement FK gagal dan seluruh migration di-rollback:
+--
+--   select 'scan_evidence' as tabel, count(*) as yatim_scan,
+--          count(*) filter (where user_id = '00000000-0000-0000-0000-000000000000') as user_placeholder
+--     from public.scan_evidence e
+--    where not exists (select 1 from public.scans s where s.id = e.scan_id)
+--   union all
+--   select 'scan_evidence_items', count(*),
+--          count(*) filter (where user_id = '00000000-0000-0000-0000-000000000000')
+--     from public.scan_evidence_items i
+--    where not exists (select 1 from public.scans s where s.id = i.scan_id);
+--
+-- Setelah Run, hasilnya harus: kolom scan_evidence_items = 11, scan_evidence = 9, dan kedua index
+-- kunci upsert ada.
 --
 --   select table_name, count(*) as columns
 --     from information_schema.columns
---    where table_name in ('scan_evidence_items','scan_evidence')
+--    where table_schema = 'public' and table_name in ('scan_evidence_items','scan_evidence')
 --    group by table_name order by table_name;
 --
 --   select indexname from pg_indexes
---     where indexname in ('scan_evidence_items_scan_evidence_key','scan_evidence_scan_key');
+--    where schemaname = 'public'
+--      and indexname in ('scan_evidence_items_pkey','scan_evidence_pkey',
+--                        'scan_evidence_items_scan_evidence_key','scan_evidence_scan_key');
