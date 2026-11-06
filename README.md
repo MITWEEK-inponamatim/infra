@@ -175,6 +175,14 @@ Slug selalu bentuk kanonik: `0812…`, `62812…`, `+62 0812…` → `62812…`;
 
 Halaman ini Partial Prerendering, jadi `await params` harus berada **di dalam** `<Suspense>`; di luarnya, `next build` gagal dengan "encountered uncached or runtime data during prerendering".
 
+## Halaman hasil ber-id scan dan riwayatnya
+
+Hasil pemeriksaan **tautan** dan **APK** pindah ke alamat sendiri setelah verdict tiba: `/recognize/url/<scan_id>` dan `/recognize/apk/<scan_id>`. Loading tetap di `/recognize` (`useScanner` menyimpan `runningKind` untuk tahu tujuan yang benar), dan perpindahan baru terjadi di poll yang sama yang menampilkan hasilnya.
+
+Berbeda dari nomor, halaman ini **tidak** menerima handoff dari memori: `ScanRecordResult` membaca ulang `GET /api/v1/scans/<id>` (satu read pertama tanpa header, sisanya `X-Activity: passive`), jadi bookmark, refresh, dan baris riwayat semuanya membuka halaman yang sama tanpa memeriksa ulang apa pun. Kalau statusnya belum final, halaman itu poll 2,5 detik sampai final. `input_ref` yang disimpan APK berbentuk `<user_id>/<scan_id>/<nama berkas>` — yang ditampilkan hanya segmen terakhir, nama berkas yang diunggah; isi APK-nya tidak pernah disajikan di UI.
+
+`/history` adalah daftarnya: `GET /api/v1/scans?type=url,application&limit=20&offset=<n>`, urut terbaru, tiap baris menaut ke halaman hasilnya. Pemeriksaan **nomor sengaja tidak masuk riwayat** karena jawabannya sudah menempel di halaman nomornya — tidak ada alamat ber-scan-id untuk jenis itu (`scanResultPath()` mengembalikan `null`, barisnya tetap tampil tapi tidak bisa diklik kalau suatu saat tipe lain muncul). Filter `?type=` divalidasi `scanTypeFilter()` terhadap tiga tipe yang benar-benar disimpan; nilai asing → `400 invalid_request`, bukan tembus ke query. Halaman baru ini juga harus didaftarkan di `safeNext()` (`SCAN_RESULT`), sonst round-trip login membuangnya ke `/recognize`.
+
 ## Analysis pipeline (graphs, tools, retention)
 
 Every scanner now runs through its own LangGraph state graph in `analysis-service/app/graph/` (`url`, `phone`, `application`) with explicit nodes, conditional edges, and a bounded follow-up (URL redirect host change). `DATABASE_URL_SESSION` enables the `PostgresSaver`; when it is empty the graphs still run and report `langgraph_checkpointer` as unavailable.
