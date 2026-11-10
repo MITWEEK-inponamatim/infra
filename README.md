@@ -83,7 +83,7 @@ Rute `/scan` tidak ada lagi; semua alur login memakai `next=/recognize` (`proxy.
 |---|---|
 | `go-api` | Public API: JWT/session, validation, Storage upload, scan rows, job polling |
 | `analysis-service` | Orchestration, LangGraph, risk engine, LLM, Storage reads |
-| `browser-gateway` / `browser-worker` / `browser-egress` | Isolated Chromium with a DNS-pinning egress proxy |
+| `browser-gateway` / `browser-worker` / `browser-egress` | Isolated Chromium with a DNS-pinning egress proxy. Chromium hanya boleh DNS ke alamat proxy-nya (`browser-egress:8888`, override `BROWSER_EGRESS_PROXY_URL`); alamat itu dan `--host-resolver-rules` dibaca dari satu nilai, jangan tulis IP subnetnya — dulu keduanya beda (172.30 vs 172.29) sehingga tiap halaman mati dengan `ERR_PROXY_CONNECTION_FAILED` dan scan tetap bilang "bukti belum cukup" |
 | `analysis-worker` | Isolated APK static analysis (no internet network, non-root, read-only rootfs, CPU/mem/pid limits) |
 
 `analysis-worker` exposes `POST /internal/v1/analyze/application`, guarded by the derived `FILE_WORKER_SERVICE_KEY`. It only extracts evidence; every risk decision stays in `analysis-service/app/apk_rules.py` and `app/risk.py`.
@@ -109,6 +109,7 @@ Unavailable checks are reported per scan in `risk.coverage.checks_unavailable` i
 | Rate limit | `PHONE_REPORT_HOURLY_LIMIT` (default 10/hour per account, in-process) |
 | Catatan | `note` is capped at 280 characters, moderation-only, never sent to an LLM and never shown to other users |
 | Moderasi | `PATCH /internal/v1/phone-reports/{id}` (service key) → `verified`, `rejected`, `rejected_spam`, `pending` |
+| Meja moderasi | Pintunya `/admin/login` (email + password Supabase, Turnstile, `POST …/auth/session/finalize` untuk membuka sesi seperti pada callback OAuth, lalu cek `GET /api/v1/admin/me`; akun non-moderator langsung keluar lagi dari sesi itu). `/admin` selalu menuju pintu itu, tidak pernah langsung ke halaman belakangnya; setelah masuk pintu membuka `/admin/dasbor`. Setelah masuk: `/admin/dasbor` → `GET /api/v1/admin/stats/desk?range=7d|30d|90d|12m` (satu panggilan untuk seluruh halaman; angkanya dihitung oleh `public.admin_desk_stats()` di Postgres, jadi migrasi `202611100010_admin_desk_stats.sql` harus sudah ada), `/admin/laporan` → `GET/PATCH /api/v1/admin/community/reports`, `/admin/posting` → `…/community/posts`. Dua antrean itu mendukung `?status=`, `?q=` dan membalas `total`; keputusan laporan diteruskan ke endpoint internal di baris atas, jadi tidak ada vocabulary kedua di Go. Sesi idle 1 jam dilempar kembali ke `/admin/login?reason=idle`. Detail: `docs/API_Contracts.md` §2.6 |
 | Bukti gambar | wajib, satu berkas per laporan. `MAX_EVIDENCE_MB` (default 5) membatasi ukuran; tipe dicek dari **magic byte**, bukan ekstensi: `png`, `jpeg`, `webp`, `heic`/`heif` diterima, `gif` dan selain gambar ditolak (`400 evidence_unsupported_type`) |
 | Bila penyimpanan bukti gagal | laporan **ditolak** (`503 evidence_unavailable`) dan tidak ada baris database yang masuk — "bukti wajib" tidak boleh diam-diam berubah jadi anjuran |
 
@@ -116,7 +117,7 @@ Validity is deliberately **not** a gate for reporting: normalisation is a search
 
 `phone_scanner.review_cards` puts the reviews of the checked number into `report.artifacts.community_reviews` (`category`, `status`, `age_days`) — up to 20, pending and verified only, and `reported_by` never leaves the server. The UI renders it as "Kata warga" under the phone result.
 
-The trust summary in `analysis-service/app/phone_scanner.py::summarize_reports` is explainable: number of reports, verified reports, distinct reporters, categories, and recency. `high` requires at least two verified reports from two different reporters, so one account repeating itself never reaches `high`. The scan report always keeps the spoofing/number-reuse/report-error limitations, and the UI shows a "Laporkan nomor ini" panel under the phone result.
+The trust summary in `analysis-service/app/phone_scanner.py::summarize_reports` is explainable: number of reports, verified reports, distinct reporters, categories, and recency. `high` requires one verified report: a claim only becomes `verified` after a moderator has read it and its screenshot, so the anti-slander gate is that human decision, not the head count — a reporter cannot promote their own report, and a waiting citizen has no reason to stay invisible until a second stranger happens to report the same number. Volume still matters for the unverified tiers (three pending reports from two different reporters reach `medium`). The scan report always keeps the spoofing/number-reuse/report-error limitations, and the UI shows a "Laporkan nomor ini" panel under the phone result.
 
 Apply `infra/supabase/migrations/202610300004_phone_reports_trust.sql` and `infra/supabase/migrations/202610300005_phone_reports_note.sql` in the hosted SQL Editor. Without `0004` duplicates are only caught by the application check; without `0005` the report is still stored and returns `note_saved: false`.
 
@@ -138,7 +139,7 @@ Board where residents tell what happened with one `+62` number, dressed in the v
 | Efek vote | **hanya urutan feed.** Tidak mengubah risiko, level, atau daftar "Nomor berbahaya" |
 | Komentar | dua tingkat saja; balasan ke balasan ditolak `400 reply_too_deep`, dan parent harus berada di post yang sama |
 | Rate limit | `COMMUNITY_POST_HOURLY_LIMIT` 6/jam, `COMMENT_MINUTE_LIMIT` 5/menit, `COMMENT_HOURLY_LIMIT` 20/jam, `VOTE_LIMIT_PER_MINUTE` 30/menit (semua in-process, ada default di kode) |
-| Tab ketiga | membaca view `dangerous_numbers`, yang ambangnya identik dengan aturan `high` di `phone_scanner.summarize_reports` (≥2 laporan terverifikasi dari ≥2 pelapor) — sumbernya tetap `phone_reports`, bukan post |
+| Tab ketiga | membaca view `dangerous_numbers`, yang ambangnya identik dengan aturan `high` di `phone_scanner._report_finding` (≥1 laporan terverifikasi) — sumbernya tetap `phone_reports`, bukan post |
 
 Frontend: `frontend/src/components/community/*`. The board has its own shell — `CommunityShell`, a 60px white bar over a `#fafafa` canvas with `#dbdbdb` hairlines — and not `SiteShell`, because a feed is read while a landing page is looked at. Type is the **system stack** (`--font-pos-ui` in `app/globals.css`): no webfont is fetched for the board, so `font-src 'self'` is never exercised and the first paint has no swap. Its palette is the `--color-pos-*` block in `app/globals.css` (`shell`, `card`, `line`, `ink`, `muted`, `action`, `action-tua`, `flag`, `good`, `bad`); the landing page and `/recognize` touch none of it, and the blue is `#0095f6` for fills only — text uses `action-tua` because `#0095f6` on white is only ~3:1.
 

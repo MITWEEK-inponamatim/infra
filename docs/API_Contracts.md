@@ -2,7 +2,7 @@
 
 Single source of truth for every HTTP boundary in the ThreatLens stack.
 
-**Version:** 2026-11-07
+**Version:** 2026-11-10
 **Repos covered:** `backend` (Go API), `analysis-service` (Python/FastAPI), `frontend` (Next.js consumer), `infra` (DB schema).
 **Rule:** any change to a request/response shape, status code, or error code MUST be reflected here and in the consumer.
 
@@ -245,6 +245,7 @@ Rate limit: `PHONE_REPORT_HOURLY_LIMIT` (10) per user.
 ### 2.5 Community board
 
 Posts are stories about a `+62` number. They never change risk. Votes and comments live under a post. A post with `status = 'removed'` is invisible to every public route.
+Two ways out exist, and they are not the same: a moderator takes a story **down** (soft, everything retained), while its author can **erase** it (hard — the row, its comments and votes, and the evidence image are gone and nothing is kept).
 
 #### `POST /api/v1/community/posts` 🔒 **multipart**
 Rate limit: `COMMUNITY_POST_HOURLY_LIMIT` (6) per user.
@@ -279,13 +280,14 @@ Query: `sort` (`new` default | `top`), `category`, `number`, `limit` (1–100, d
       "title": "…", "body": "…", "evidence_url": "https://res.cloudinary.com/…",
       "author_alias": "Warga-a1b2c3",
       "up_count": 3, "down_count": 1, "score": 2, "comment_count": 4,
-      "created_at": "…", "status": "active", "my_vote": 1 }
+      "created_at": "…", "status": "active", "my_vote": 1, "is_author": false }
   ],
   "sort": "new", "limit": 20, "offset": 0
 }
 ```
 
 `my_vote`: `1` | `-1` | `0` (absent/0 = no vote).
+`is_author`: true only on the caller's own posts — the feed uses it to offer the delete button. `author_user_id` and `evidence_public_id` are read by the API to answer that and never leave it.
 
 | Status | Code |
 |---|---|
@@ -299,13 +301,15 @@ Query: `sort` (`new` default | `top`), `category`, `number`, `limit` (1–100, d
   "post": { "...": "same shape as feed row, plus my_vote" },
   "comments": [
     { "id": "<uuid>", "post_id": "<uuid>", "parent_id": null,
-      "body": "…", "author_alias": "Warga-a1b2c3", "created_at": "…",
-      "replies": [ { "id": "…", "parent_id": "…", "body": "…", "author_alias": "…", "created_at": "…" } ] }
+      "body": "…", "author_alias": "Warga-a1b2c3", "created_at": "…", "is_author": false,
+      "replies": [ { "id": "…", "parent_id": "…", "body": "…", "author_alias": "…", "created_at": "…", "is_author": false } ] }
   ]
 }
 ```
 
-Comments are two levels max. `COMMENT_PAGE_SIZE` (200) caps the page.
+Comments are two levels max. `COMMENT_PAGE_SIZE` (200) caps the page. `is_author` works exactly as it
+does on posts: one bit that says this row is the reader's own to erase. `author_user_id` is read by
+the API to answer it and is stripped before the row leaves.
 
 | Status | Code |
 |---|---|
@@ -350,6 +354,40 @@ Rate limit: `COMMENT_MINUTE_LIMIT` (5)/min and `COMMENT_HOURLY_LIMIT` (20)/hour 
 | 429 | `rate_limited` |
 | 503 | `service_unavailable` |
 
+#### `DELETE /api/v1/community/posts/{postID}` 🔒
+The author erases their own story permanently. There is no soft option, no restore and no audit
+row: `community_posts` cascades to the votes and comments, and the Cloudinary evidence is destroyed
+after the row is gone. Somebody else's post answers exactly like a missing one, so the route cannot
+be used to find out which ids exist or who owns them.
+
+```json
+204            // empty body
+```
+
+| Status | Code |
+|---|---|
+| 404 | `not_found` (missing, already erased, or written by another account) |
+| 503 | `service_unavailable` (the row was not deleted) |
+
+#### `DELETE /api/v1/community/posts/{postID}/comments/{commentID}` 🔒
+The author erases one of their own comments or replies, permanently — same rule as a story, so no
+restore and nothing kept. Ownership sits inside the delete predicate (`id` + `post_id` +
+`author_user_id`), which is why a comment that is not yours answers as `not_found` rather than
+`forbidden`: the route cannot be walked to find out who wrote what.
+
+`parent_id` is declared `on delete cascade`, so deleting a top-level comment takes its replies with
+it — including replies written by other accounts. The confirm dialog says so before the click.
+The `comment_count` triggers on `community_comments` recount the post automatically; no extra write.
+
+```json
+204            // empty body
+```
+
+| Status | Code |
+|---|---|
+| 404 | `not_found` (malformed id, missing, already erased, or written by another account) |
+| 503 | `service_unavailable` (the row was not deleted) |
+
 #### `GET /api/v1/community/dangerous-numbers` 🔒
 Query: `limit` (1–100, default 20), `offset`.
 
@@ -364,23 +402,99 @@ Query: `limit` (1–100, default 20), `offset`.
 }
 ```
 
-Threshold: `verified_reports >= 2 AND verified_reporters >= 2` (mirrors `analysis-service/app/phone_scanner.py::summarize_reports`).
+Threshold: `verified_reports >= 1` — satu persetujuan moderator sudah cukup (mirrors the `high` rule in `analysis-service/app/phone_scanner.py::_report_finding`).
 
 | Status | Code |
 |---|---|
 | 503 | `service_unavailable` (view missing → migration not applied) |
 
-### 2.6 Admin — community moderation 🔑
+### 2.6 Admin — moderation desk 🔑
 
-Middleware: `authenticated` → `profiles.role = 'admin'`. Non-admin gets `403 admin_required`.
+Console routes hang on `authenticated` → `profiles.role = 'admin'`. Non-admin gets `403 admin_required`.
 
-#### `GET /api/v1/admin/community/posts`
-Query: `status` (`all` default | `active` | `removed`), `limit` (1–100, default 20), `offset`.
-
-Returns **all** posts regardless of status, newest first.
+#### `GET /api/v1/admin/me`
+Behind `authenticated` only, so a signed-in non-admin can hide the door instead of walking into a 403.
+The desk's sign-in page (`/admin/login`) calls it after `signInWithPassword` and drops the session
+again when the answer is not `admin`. Before that call it must spend the captcha preflight with
+`POST /api/v1/auth/session/finalize` (the same step the OAuth callback performs): without a
+finalized session every authenticated route answers `403 session_required`, role included.
 
 ```json
-200 { "posts": [ { "...": "same row shape as the public feed" } ], "limit": 20, "offset": 0 }
+200 { "role": "admin" }   // or "user"
+```
+
+| Status | Code |
+|---|---|
+| 401 | `unauthenticated` |
+| 500 | `internal_error` (role unreadable — never treated as a grant) |
+
+#### `GET /api/v1/admin/community/reports`
+Query: `status` (`pending` default | `verified` | `rejected` | `rejected_spam` | `all`),
+`q`, `limit` (1–100, default 20), `offset`.
+
+`q` reads like the console's search box: text that normalises to a number matches `number_e164`
+exactly; anything else is a case-insensitive substring of `number_e164`, `note` or `category`.
+
+Returns reports in every state, newest first. `reported_by` and `evidence_public_id` are stripped
+and replaced by `reporter_alias` — a moderator decides on the claim and the screenshot, never on who
+filed them.
+
+```json
+200 {
+  "reports": [ { "id": "<uuid>", "number_e164": "+62812…", "category": "penipuan",
+                 "source": "user_report", "status": "pending", "note": "…",
+                 "evidence_url": "https://…", "reporter_alias": "Warga-1a2b3c",
+                 "created_at": "…" } ],
+  "status": "pending", "limit": 20, "offset": 0, "total": 214
+}
+```
+
+`total` counts the whole filtered queue, not the page. If the count query fails the key is omitted
+rather than guessed at; the list is still correct and the UI pages without a total.
+
+| Status | Code |
+|---|---|
+| 400 | `invalid_status` |
+| 403 | `admin_required` |
+| 500 | `internal_error` |
+
+#### `PATCH /api/v1/admin/community/reports/{reportID}/status`
+The decision endpoint. The Go API owns no status vocabulary of its own: it forwards to
+`analysis-service` `PATCH /internal/v1/phone-reports/{id}`, which counts the outcome. Only
+`verified` has an effect outside the desk: that one click is what puts the number on the
+dangerous list.
+
+`PATCH` has to stay in `Access-Control-Allow-Methods` in `backend` CORS middleware: the desk is a
+browser origin, and a method missing from that list is refused by the preflight, so the decision
+never reaches Go and the moderator only sees a failed request.
+
+```json
+{ "status": "verified" }   // pending | verified | rejected | rejected_spam
+```
+
+```json
+200 { "id": "<uuid>", "status": "verified" }
+200 { "id": "<uuid>", "status": "pending", "unchanged": true }   // already in that state, nothing forwarded
+```
+
+| Status | Code |
+|---|---|
+| 400 | `invalid_report_id`, `invalid_json`, `invalid_status` |
+| 403 | `admin_required` |
+| 404 | `report_not_found` |
+| 503 | `moderation_unavailable` (analysis service unreachable — the decision was **not** written) |
+| 500 | `internal_error` |
+
+#### `GET /api/v1/admin/community/posts`
+Query: `status` (`all` default | `active` | `removed`), `q` (same rule as the report queue, over
+`number_e164`, `title`, `body`), `limit` (1–100, default 20), `offset`.
+
+Returns **all** posts regardless of status, newest first, with `total` under the same rule as above.
+Moderators see the story and the screenshot, never the account id behind the alias or the evidence's
+Cloudinary key, so there is no `is_author` here either — a moderator does not delete, only takes down.
+
+```json
+200 { "posts": [ { "...": "same row shape as the public feed" } ], "status": "all", "limit": 20, "offset": 0, "total": 37 }
 ```
 
 | Status | Code |
@@ -406,6 +520,49 @@ Soft delete / restore. The row and its evidence are retained; only `status` flip
 | 403 | `admin_required` |
 | 404 | `post_not_found` |
 | 500 | `internal_error` |
+
+#### `GET /api/v1/admin/stats/desk`
+Query: `range` (`7d` | `30d` default | `90d` | `12m`); an empty value falls back to `30d`, anything
+else is refused rather than guessed at.
+
+One call answers the whole dashboard (`/admin/dasbor`). The arithmetic happens in Postgres, in
+`public.admin_desk_stats(text)` (`supabase/migrations/202611100010_admin_desk_stats.sql`), for two
+reasons: PostgREST cannot group by a truncated timestamp, and the Go `supabase()` helper cuts a
+response at 1 MiB, so pulling raw rows to count them in Go would silently under-count instead of
+failing.
+
+Each range is a whole number of buckets — `7d`/`30d` daily, `90d` 13 weekly, `12m` 12 monthly — and
+the comparison period is the same span shifted back one span. That is what lets the previous period
+line up slot for slot with the current one on the chart.
+
+```json
+200 {
+  "range": "30d", "bucket": "day",
+  "totals": { "accounts": { "current": 12, "previous": 9 }, "reports": { "…": 0 },
+              "posts": { "…": 0 }, "numbers": { "…": 0 } },
+  "series": { "accounts": [ { "bucket": "2026-10-12", "current": 0, "previous": 1 } ],
+              "reports": [ "…" ], "posts": [ "…" ], "numbers": [ "…" ] },
+  "categories": [ { "label": "penipuan", "value": 41 } ],
+  "statuses": { "pending": 3, "verified": 180, "rejected": 22, "rejected_spam": 9 },
+  "queue_total": 214, "report_total": 66, "dangerous": 12,
+  "recent": [ { "id": "<uuid>", "number_e164": "+62812…", "category": "penipuan", "status": "pending",
+                "reporter_alias": "Warga-1a2b3c", "evidence_url": "https://…", "created_at": "…" } ]
+}
+```
+
+- `statuses` and `queue_total` are **all-time**: the rows waiting for a decision today do not depend
+  on the range a chart is drawn over. `report_total` and every other figure follow the range.
+- `totals.numbers` is `count(distinct number_e164)` over the whole range, so the `numbers` series can
+  add up to more than the total — one number reported in two buckets is two points and one number.
+- `recent` is the 60 newest in-range reports, newest first, passed through the same `redactReporter`
+  as the queues: `reported_by` and `evidence_public_id` never leave Go.
+- Timestamps are truncated in UTC, so a server timezone change cannot shift a bucket.
+
+| Status | Code |
+|---|---|
+| 400 | `invalid_range` |
+| 403 | `admin_required` |
+| 500 | `internal_error` (aggregate missing → migration not applied) |
 
 ### 2.7 Internal (backend-internal, still served by the Go process)
 
@@ -579,6 +736,7 @@ All bodies are raw APK bytes unless noted. Key: `FILE_WORKER_SERVICE_KEY`.
 | `created_at` | RFC3339 | |
 | `status` | string | `active` \| `removed` |
 | `my_vote` | int | `1` \| `-1` \| `0`; caller-scoped |
+| `is_author` | bool | caller-scoped; offers the delete button |
 
 `author_user_id` is **never** serialized to a browser.
 
@@ -591,7 +749,9 @@ All bodies are raw APK bytes unless noted. Key: `FILE_WORKER_SERVICE_KEY`.
 | `parent_id` | uuid \| null | max depth 2 |
 | `body` | string | 1–1000 |
 | `author_alias` | string | same alias scheme |
+| `author_user_id` | uuid | read by the API for `is_author`; stripped from every response |
 | `created_at` | RFC3339 | |
+| `is_author` | bool | caller-scoped; offers the delete control on the writer's own row |
 | `replies` | array | present on top-level rows in detail responses |
 
 ### 5.3 `DangerousNumber`
@@ -638,7 +798,7 @@ All bodies are raw APK bytes unless noted. Key: `FILE_WORKER_SERVICE_KEY`.
 | `invalid_input` / `invalid_url` / `invalid_phone` | 400 | Field validation |
 | `invalid_category` / `invalid_title` / `invalid_body` | 400 | Community field validation |
 | `invalid_vote` / `invalid_parent` / `reply_too_deep` | 400 | Vote/comment rules |
-| `invalid_status` / `invalid_post_id` | 400 | Admin validation |
+| `invalid_status` / `invalid_post_id` / `invalid_report_id` | 400 | Admin validation |
 | `not_indonesian` | 400 | Normalised number lacks `+62` |
 | `evidence_required` | 400 | Multipart proof missing |
 | `evidence_unsupported_type` | 400 | Image mime not allowed |
@@ -647,12 +807,13 @@ All bodies are raw APK bytes unless noted. Key: `FILE_WORKER_SERVICE_KEY`.
 | `file_too_large` / `evidence_too_large` | 413 | Size ceiling exceeded |
 | `rate_limited` | 429 | Sliding-window quota (has `Retry-After`) |
 | `not_found` | 404 | Scan/post/comment missing |
-| `post_not_found` | 404 | Admin target missing |
+| `post_not_found` / `report_not_found` | 404 | Admin decision target missing |
 | `captcha_failed` | 403 | Turnstile rejection |
 | `captcha_unavailable` | 502/503 | Turnstile unreachable/not configured |
 | `evidence_unavailable` | 503 | Cloudinary unavailable |
 | `storage_unavailable` | 503 | Supabase Storage unavailable |
 | `service_unavailable` | 503 | DB/analysis service unavailable |
+| `moderation_unavailable` | 503 | Report decision not forwarded to analysis service (nothing written) |
 | `internal_error` | 500 | Unhandled admin/store failure |
 
 ---
@@ -667,7 +828,7 @@ All bodies are raw APK bytes unless noted. Key: `FILE_WORKER_SERVICE_KEY`.
 | Evidence mimes | `evidenceMime` | `ALLOWED_EVIDENCE_MIME` | `EVIDENCE_TYPES` |
 | Number shape | `communityNumberShape` (`^\+62[0-9]{8,20}$`) | — | — |
 | Alias shape | `communityAlias` | — | — |
-| Dangerous threshold | view `dangerous_numbers` | `summarize_reports` | — |
+| Dangerous threshold | view `dangerous_numbers` | `_report_finding` | — |
 
 Changing any of these means changing all three columns.
 
@@ -686,6 +847,7 @@ Migrations live in `infra/supabase/migrations/`. Applied in filename order.
 | `202611040006_phone_reports_evidence.sql` | `evidence_url`, `evidence_public_id` |
 | `202611040007_community_posts.sql` | `community_posts`, `community_votes`, `community_comments`, `dangerous_numbers` view |
 | `202611070001_admin_roles.sql` | `profiles.role` (`user` \| `admin`) |
+| `202611090009_dangerous_numbers_single_approval.sql` | view `dangerous_numbers` diturunkan ke `verified_reports >= 1` |
 
 RLS: every table is closed to `anon`/`authenticated`; only `service_role` (used by Go and Python) reads/writes. The API is the only door.
 

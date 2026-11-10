@@ -101,7 +101,7 @@ Semua fungsi backend Go (routing endpoint, upload file, pencatatan LLM, history,
 | `community_posts` | id, number_e164, category, title, body, evidence_url, evidence_public_id, author_user_id, author_alias, status, up_count, down_count, score (generated), comment_count, created_at — cerita warga, **bukan** sinyal risiko |
 | `community_votes` | post_id + user_id (PK), value (±1) — satu suara per akun per cerita; hanya mengubah urutan feed |
 | `community_comments` | id, post_id, parent_id (self-FK, maksimal satu tingkat), body, author_user_id, author_alias, status, created_at |
-| `dangerous_numbers` (view) | agregat `phone_reports` (laporan terverifikasi ≥2 dari ≥2 pelapor) + hitungan cerita; dipakai tab "Nomor berbahaya" |
+| `dangerous_numbers` (view) | agregat `phone_reports` (≥1 laporan terverifikasi — persetujuan moderator yang memasukkannya) + hitungan cerita; dipakai tab "Nomor berbahaya" |
 
 Checkpoint LangGraph disimpan di schema terpisah (mis. `langgraph`) yang **tidak diekspos** lewat PostgREST/API Supabase.
 
